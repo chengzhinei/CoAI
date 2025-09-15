@@ -1,119 +1,151 @@
-BRANCH := $(shell git rev-parse --abbrev-ref HEAD)
-COMMIT := $(shell git log -1 --format='%H')
-APPNAME := coai
+#!/usr/bin/make -f
 
-# don't override user values
-ifeq (,$(VERSION))
-  VERSION := $(shell git describe --exact-match 2>/dev/null)
-  # if VERSION is empty, then populate it with branch's name and raw commit hash
-  ifeq (,$(VERSION))
-    VERSION := $(BRANCH)-$(COMMIT)
+VERSION ?= $(shell echo $(shell git describe --tags --always) | sed 's/^v//')
+TMVERSION := $(shell go list -m github.com/cometbft/cometbft | sed 's:.* ::')
+COMMIT := $(shell git log -1 --format='%H')
+LEDGER_ENABLED ?= true
+BINDIR ?= $(GOPATH)/bin
+COAI_BINARY = coaid
+BUILDDIR ?= $(CURDIR)/build
+
+export GO111MODULE = on
+
+# Default target executed when no arguments are given to make.
+default_target: all
+
+.PHONY: build, default_target
+
+# process build tags
+
+build_tags = netgo
+ifeq ($(LEDGER_ENABLED),true)
+  ifeq ($(OS),Windows_NT)
+    GCCEXE = $(shell where gcc.exe 2> NUL)
+    ifeq ($(GCCEXE),)
+      $(error gcc.exe not installed for ledger support, please install or set LEDGER_ENABLED=false)
+    else
+      build_tags += ledger
+    endif
+  else
+    UNAME_S = $(shell uname -s)
+    ifeq ($(UNAME_S),OpenBSD)
+      $(warning OpenBSD detected, disabling ledger support (https://github.com/cosmos/cosmos-sdk/issues/1988))
+    else
+      GCC = $(shell command -v gcc 2> /dev/null)
+      ifeq ($(GCC),)
+        $(error gcc not installed for ledger support, please install or set LEDGER_ENABLED=false)
+      else
+        build_tags += ledger
+      endif
+    endif
   endif
 endif
 
-# Update the ldflags with the app, client & server names
-ldflags = -X github.com/cosmos/cosmos-sdk/version.Name=$(APPNAME) \
-	-X github.com/cosmos/cosmos-sdk/version.AppName=$(APPNAME)d \
-	-X github.com/cosmos/cosmos-sdk/version.Version=$(VERSION) \
-	-X github.com/cosmos/cosmos-sdk/version.Commit=$(COMMIT)
+ifeq (cleveldb,$(findstring cleveldb,$(COSMOS_BUILD_OPTIONS)))
+  build_tags += gcc
+endif
+build_tags += $(BUILD_TAGS)
+build_tags := $(strip $(build_tags))
 
-BUILD_FLAGS := -ldflags '$(ldflags)'
+# process linker flags
 
-##############
-###  Test  ###
-##############
+ldflags = -X github.com/cosmos/cosmos-sdk/version.Name=coai \
+          -X github.com/cosmos/cosmos-sdk/version.AppName=$(COAI_BINARY) \
+          -X github.com/cosmos/cosmos-sdk/version.Version=$(VERSION) \
+          -X github.com/cosmos/cosmos-sdk/version.Commit=$(COMMIT) \
+          -X github.com/cometbft/cometbft/version.TMCoreSemVer=$(TMVERSION)
 
-test-unit:
-	@echo Running unit tests...
-	@go test -mod=readonly -v -timeout 30m ./...
+# DB backend selection
+ifeq (cleveldb,$(findstring cleveldb,$(COSMOS_BUILD_OPTIONS)))
+  ldflags += -X github.com/cosmos/cosmos-sdk/types.DBBackend=cleveldb
+endif
+ifeq (badgerdb,$(findstring badgerdb,$(COSMOS_BUILD_OPTIONS)))
+  ldflags += -X github.com/cosmos/cosmos-sdk/types.DBBackend=badgerdb
+endif
+# handle rocksdb
+ifeq (rocksdb,$(findstring rocksdb,$(COSMOS_BUILD_OPTIONS)))
+  CGO_ENABLED=1
+  build_tags += rocksdb grocksdb_no_link
+  VERSION := $(VERSION)-rocksdb
+  ldflags += -X github.com/cosmos/cosmos-sdk/types.DBBackend=rocksdb
+endif
+# handle boltdb
+ifeq (boltdb,$(findstring boltdb,$(COSMOS_BUILD_OPTIONS)))
+  build_tags += boltdb
+  ldflags += -X github.com/cosmos/cosmos-sdk/types.DBBackend=boltdb
+endif
+# handle pebbledb
+ifeq (pebbledb,$(findstring pebbledb,$(COSMOS_BUILD_OPTIONS)))
+  build_tags += pebbledb
+  VERSION := $(VERSION)-pebbledb
+  ldflags += -X github.com/cosmos/cosmos-sdk/types.DBBackend=pebbledb
+endif
 
-test-race:
-	@echo Running unit tests with race condition reporting...
-	@go test -mod=readonly -v -race -timeout 30m ./...
+# add build tags to linker flags
+whitespace := $(subst ,, )
+comma := ,
+build_tags_comma_sep := $(subst $(whitespace),$(comma),$(build_tags))
+ldflags += -X "github.com/cosmos/cosmos-sdk/version.BuildTags=$(build_tags_comma_sep)"
 
-test-cover:
-	@echo Running unit tests and creating coverage report...
-	@go test -mod=readonly -v -timeout 30m -coverprofile=$(COVER_FILE) -covermode=atomic ./...
-	@go tool cover -html=$(COVER_FILE) -o $(COVER_HTML_FILE)
-	@rm $(COVER_FILE)
+ifeq (,$(findstring nostrip,$(COSMOS_BUILD_OPTIONS)))
+  ldflags += -w -s
+endif
+ldflags += $(LDFLAGS)
+ldflags := $(strip $(ldflags))
 
-bench:
-	@echo Running unit tests with benchmarking...
-	@go test -mod=readonly -v -timeout 30m -bench=. ./...
+BUILD_FLAGS := -tags "$(build_tags)" -ldflags '$(ldflags)'
+# check for nostrip option
+ifeq (,$(findstring nostrip,$(COSMOS_BUILD_OPTIONS)))
+  BUILD_FLAGS += -trimpath
+endif
 
-test: govet govulncheck test-unit
+# check if no optimization option is passed
+# used for remote debugging
+ifneq (,$(findstring nooptimization,$(COSMOS_BUILD_OPTIONS)))
+  BUILD_FLAGS += -gcflags "all=-N -l"
+endif
 
-.PHONY: test test-unit test-race test-cover bench
+# # The below include contains the tools and runsim targets.
+# include contrib/devtools/Makefile
 
-#################
-###  Install  ###
-#################
+###############################################################################
+###                                  Build                                  ###
+###############################################################################
 
-all: install
+BUILD_TARGETS := build install
 
-install:
-	@echo "--> ensure dependencies have not been modified"
-	@go mod verify
-	@echo "--> installing $(APPNAME)d"
-	@go install $(BUILD_FLAGS) -mod=readonly ./cmd/$(APPNAME)d
+build: BUILD_ARGS=-o $(BUILDDIR)/
+build-linux:
+	GOOS=linux GOARCH=amd64 LEDGER_ENABLED=false $(MAKE) build
 
-.PHONY: all install
+$(BUILD_TARGETS): go.sum $(BUILDDIR)/
+	CGO_ENABLED="1" go $@ $(BUILD_FLAGS) $(BUILD_ARGS) ./...
 
-##################
-###  Protobuf  ###
-##################
+$(BUILDDIR)/:
+	mkdir -p $(BUILDDIR)/
 
-# Use this target if you do not want to use Ignite for generating proto files
-GOLANG_PROTOBUF_VERSION=1.28.1
-GRPC_GATEWAY_VERSION=1.16.0
-GRPC_GATEWAY_PROTOC_GEN_OPENAPIV2_VERSION=2.20.0
+$(MOCKS_DIR):
+	mkdir -p $(MOCKS_DIR)
 
-proto-deps:
-	@echo "Installing proto deps"
-	@go install github.com/bufbuild/buf/cmd/buf@v1.50.0
-	@go install github.com/cosmos/gogoproto/protoc-gen-gogo@latest
-	@go install github.com/cosmos/cosmos-proto/cmd/protoc-gen-go-pulsar@latest
-	@go install google.golang.org/protobuf/cmd/protoc-gen-go@v$(GOLANG_PROTOBUF_VERSION)
-	@go install github.com/grpc-ecosystem/grpc-gateway/protoc-gen-grpc-gateway@v$(GRPC_GATEWAY_VERSION)
-	@go install github.com/grpc-ecosystem/grpc-gateway/v2/protoc-gen-openapiv2@v$(GRPC_GATEWAY_PROTOC_GEN_OPENAPIV2_VERSION)
-	@go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
+distclean: clean tools-clean
 
-proto-gen:
-	@echo "Generating protobuf files..."
-	@ignite generate proto-go --yes
+clean:
+	rm -rf \
+    $(BUILDDIR)/ \
+    artifacts/ \
+    tmp-swagger-gen/
 
-.PHONY: proto-deps proto-gen
+all: build
 
-#################
-###  Linting  ###
-#################
+build-all: tools build lint test vulncheck
 
-golangci_lint_cmd=golangci-lint
-golangci_version=v1.61.0
+.PHONY: distclean clean build-all
 
-lint:
-	@echo "--> Running linter"
-	@go install github.com/golangci/golangci-lint/cmd/golangci-lint@$(golangci_version)
-	@$(golangci_lint_cmd) run ./... --timeout 15m
+###############################################################################
+###                          Tools & Dependencies                           ###
+###############################################################################
 
-lint-fix:
-	@echo "--> Running linter and fixing issues"
-	@go install github.com/golangci/golangci-lint/cmd/golangci-lint@$(golangci_version)
-	@$(golangci_lint_cmd) run ./... --fix --timeout 15m
-
-.PHONY: lint lint-fix
-
-###################
-### Development ###
-###################
-
-govet:
-	@echo Running go vet...
-	@go vet ./...
-
-govulncheck:
-	@echo Running govulncheck...
-	@go install golang.org/x/vuln/cmd/govulncheck@latest
-	@govulncheck ./...
-
-.PHONY: govet govulncheck
+go.sum: go.mod
+	echo "Ensure dependencies have not been modified ..." >&2
+	go mod verify
+	go mod tidy
