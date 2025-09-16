@@ -222,4 +222,5 @@ coaid start \
 	--minimum-gas-prices=0.0001acoai \
 	--json-rpc.api eth,txpool,personal,net,debug,web3 \
 	--home "$HOMEDIR" \
+	--json-rpc.address=0.0.0.0:8545 \
 	--chain-id "$CHAINID"
